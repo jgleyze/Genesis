@@ -1458,16 +1458,18 @@ class RigidEntity(Entity):
         ignore_collision=False,
         ignore_joint_limit=False,
         planner="RRTConnect",
+        env_idx=None,
     ):
         """
         Plan a path from `qpos_start` to `qpos_goal`.
 
         Parameters
         ----------
-        qpos_goal : array_like
-            The goal state.
-        qpos_start : None | array_like, optional
+        qpos_goal : array_like or list of array_like
+            The goal state. If batched environments are used, a list/tensor of goals (one per specified environment).
+        qpos_start : None | array_like or list of array_like, optional
             The start state. If None, the current state of the rigid entity will be used. Defaults to None.
+            If batched environments are used a list/tensor of start states (one per specified environment).
         timeout : float, optional
             The maximum time (in seconds) allowed for the motion planning algorithm to find a solution. Defaults to 5.0.
         smooth_path : bool, optional
@@ -1480,11 +1482,16 @@ class RigidEntity(Entity):
             Whether to ignore joint limits during motion planning. Defaults to False.
         planner : str, optional
             The name of the motion planning algorithm to use. Supported planners: 'PRM', 'RRT', 'RRTConnect', 'RRTstar', 'EST', 'FMT', 'BITstar', 'ABITstar'. Defaults to 'RRTConnect'.
+        env_idx : None | array_like, optional
+            The indices of the environments to plan for. If None and batched environments are used, 
+            paths will be planned for all environments. Defaults to None.
 
         Returns
         -------
-        waypoints : list
-            A list of waypoints representing the planned path. Each waypoint is an array storing the entity's qpos of a single time step.
+        waypoints : list or list of lists
+            If operating on a single environment, returns a list of waypoints representing the planned path.
+            If operating on multiple environments, returns a list of lists, where each inner list contains
+            the waypoints for one environment. Each waypoint is an array storing the entity's qpos of a single time step.
         """
 
         ########## validate ##########
@@ -1496,16 +1503,78 @@ class RigidEntity(Entity):
             if gs.platform == "Windows":
                 gs.raise_exception_from("No pre-compiled binaries of OMPL are not distributed on Windows OS.", e)
             else:
-                raise
-
+                print(e)
+            
+        # Handle batched environments
         if self._solver.n_envs > 0:
-            gs.raise_exception("Motion planning is not supported for batched envs (yet).")
+            gs.logger.info("Batched environments detected. Planning for multiple environments SEQUENTIALLY.")
+            
+            # Process environment indices
+            if env_idx is None:
+                # Plan for all environments
+                env_indices = range(self._solver.n_envs)
+            else:
+                # Plan for specified environments
+                env_indices = list(env_idx)
+                
+            # Convert inputs to lists for batch processing if they're not already
+            qpos_goal_list = torch.unbind(qpos_goal, dim=0)
+            qpos_start_list = torch.unbind(qpos_start, dim=0) if qpos_start is not None else [None] * len(env_indices)
+            
+            # Plan paths sequentially for each environment
+            all_waypoints = []
 
+            for i, idx in enumerate(env_indices):
+                # Set up the environment context
+                goal = qpos_goal_list[i]
+                start = qpos_start_list[i]
+                
+                # Plan the path for this environment
+                waypoints = self._plan_path_single_env(
+                    goal, start, timeout, smooth_path, num_waypoints,
+                    ignore_collision, ignore_joint_limit, planner, idx
+                )
+                
+                all_waypoints.append(waypoints)
+                
+                
+            print(all_waypoints)
+                
+            waypoints_tensor = torch.tensor(all_waypoints)
+            
+            
+            
+        else:
+            # Non-batched case - use the original implementation
+            return self._plan_path_single_env(
+                qpos_goal, qpos_start, timeout, smooth_path, num_waypoints,
+                ignore_collision, ignore_joint_limit, planner
+            )
+            
+    def _plan_path_single_env(
+            self,
+            qpos_goal,
+            qpos_start=None,
+            timeout=5.0,
+            smooth_path=True,
+            num_waypoints=100,
+            ignore_collision=False,
+            ignore_joint_limit=False,
+            planner="RRTConnect",
+            env_idx=0,
+        ):
+        
+        from ompl import base as ob
+        from ompl import geometric as og
+        from ompl import util as ou
+        
+        """Implementation of path planning for a single environment."""
+        
         if self.n_qs != self.n_dofs:
             gs.raise_exception("Motion planning is not yet supported for rigid entities with free joints.")
 
         if qpos_start is None:
-            qpos_start = self.get_qpos()
+            qpos_start = self.get_qpos(envs_idx=env_idx).squeeze(0)
         qpos_start = tensor_to_array(qpos_start)
         qpos_goal = tensor_to_array(qpos_goal)
 
@@ -1547,17 +1616,20 @@ class RigidEntity(Entity):
 
         geoms_idx = list(range(self._geom_start, self._geom_start + len(self._geoms)))
         mask_collision_pairs = set(
-            (i_ga, i_gb) for i_ga, i_gb in self.detect_collision() if i_ga in geoms_idx or i_gb in geoms_idx
+            (i_ga, i_gb) for i_ga, i_gb in self.detect_collision(env_idx=env_idx) if i_ga in geoms_idx or i_gb in geoms_idx
         )
         if not ignore_collision and mask_collision_pairs:
-            gs.logger.info("Ingoring collision pairs already active for starting pos.")
+            gs.logger.info("Ignoring collision pairs already active for starting pos.")
 
+        # Save current qpos to restore later
+        original_qpos = self.get_qpos(envs_idx=env_idx)
+        
         def is_ompl_state_valid(state):
             if ignore_collision:
                 return True
             qpos = torch.tensor([state[i] for i in range(self.n_qs)], dtype=gs.tc_float, device=gs.device)
-            self.set_qpos(qpos, zero_velocity=False)
-            collision_pairs = set(map(tuple, self.detect_collision()))
+            self.set_qpos(qpos, envs_idx=env_idx, zero_velocity=False)
+            collision_pairs = set(map(tuple, self.detect_collision(env_idx=env_idx)))
             return not (collision_pairs - mask_collision_pairs)
 
         ss.setStateValidityChecker(ob.StateValidityCheckerFn(is_ompl_state_valid))
@@ -1581,7 +1653,7 @@ class RigidEntity(Entity):
         solved = ss.solve(timeout)
         waypoints = []
         if solved:
-            gs.logger.info("Path solution found successfully.")
+            gs.logger.info(f"Path solution found successfully for environment {env_idx}.")
             path = ss.getSolutionPath()
             if smooth_path:
                 ps = og.PathSimplifier(ss.getSpaceInformation())
@@ -1600,10 +1672,10 @@ class RigidEntity(Entity):
                 for state in path.getStates()
             ]
         else:
-            gs.logger.warning("Path planning failed. Returning empty path.")
+            gs.logger.warning(f"Path planning failed for environment {env_idx}. Returning empty path.")
 
         ########## restore original state #########
-        self.set_qpos(qpos_start, zero_velocity=False)
+        self.set_qpos(original_qpos, envs_idx=env_idx, zero_velocity=False)
 
         return waypoints
 
